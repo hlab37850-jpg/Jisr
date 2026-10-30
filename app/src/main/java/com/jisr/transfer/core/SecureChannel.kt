@@ -7,7 +7,7 @@ import java.io.OutputStream
 import java.security.GeneralSecurityException
 import java.security.MessageDigest
 
-const val CHUNK = 256 * 1024
+const val CHUNK = 512 * 1024
 const val MAX_PLAIN = 1 shl 20
 
 internal fun readFully(inp: InputStream, b: ByteArray, off: Int, len: Int) {

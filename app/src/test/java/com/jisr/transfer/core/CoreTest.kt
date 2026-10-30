@@ -2,15 +2,19 @@ package com.jisr.transfer.core
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.Random
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.AEADBadTagException
 import kotlin.concurrent.thread
@@ -24,6 +28,18 @@ class MemSink : Sink {
             files[name] = bo.toByteArray()
             return name
         }
+        override fun discard() {}
+    }
+}
+
+/** قرص «ممتلئ»: كل كتابة تفشل. */
+class FailSink : Sink {
+    override fun create(name: String, size: Long): SinkFile = object : SinkFile {
+        override val out: OutputStream = object : OutputStream() {
+            override fun write(b: Int) = throw IOException("disk full")
+            override fun write(b: ByteArray, off: Int, len: Int) = throw IOException("disk full")
+        }
+        override fun commit(): String = name
         override fun discard() {}
     }
 }
@@ -80,6 +96,13 @@ class CoreTest {
         assertArrayEquals(psk, p.psk)
     }
 
+    @Test
+    fun sanitizeNameBlocksTraversalAndIllegalChars() {
+        assertEquals("a_b_.txt", sanitizeName("../a:b?.txt"))
+        assertEquals("x.txt", sanitizeName("..\\..\\x.txt"))
+        assertEquals("file", sanitizeName("..."))
+    }
+
     private fun pair(pskS: ByteArray, pskR: ByteArray): Pair<SecureChannel, SecureChannel> {
         val srv = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
         val sender = AtomicReference<SecureChannel>()
@@ -87,7 +110,7 @@ class CoreTest {
             try {
                 val s = srv.accept()
                 sender.set(Handshake.asSender(s.getInputStream(), s.getOutputStream(), pskS))
-            } catch (_: Throwable) {
+            } catch (ignored: Throwable) {
             }
         }
         val c = Socket(InetAddress.getLoopbackAddress(), srv.localPort)
@@ -124,7 +147,7 @@ class CoreTest {
         val err = AtomicReference<Throwable>()
         val t = thread(isDaemon = true) {
             try {
-                res.set(Receiver.receive(r, sink, {}, {}))
+                res.set(Receiver.receive(r, sink, { true }, {}))
             } catch (e: Throwable) {
                 err.set(e)
             }
@@ -135,5 +158,57 @@ class CoreTest {
         assertEquals(4, outS.ok)
         assertEquals(4, res.get().ok)
         datas.forEachIndexed { i, d -> assertArrayEquals("file $i", d, sink.files["f$i.bin"]) }
+    }
+
+    @Test
+    fun receiverDeclineStopsSender() {
+        val psk = Crypto.random(32)
+        val (s, r) = pair(psk, psk)
+        thread(isDaemon = true) {
+            try {
+                Receiver.receive(r, MemSink(), { false }, {})
+            } catch (ignored: Throwable) {
+            }
+        }
+        try {
+            Sender.send(s, listOf(SendItem("a", 3) { ByteArrayInputStream(byteArrayOf(1, 2, 3)) })) {}
+            fail("expected DeclinedException")
+        } catch (e: IOException) {
+            assertTrue(e is DeclinedException)
+        }
+    }
+
+    /** يمنع تكرار خطأ انهيار التطبيق: فشل القرص أثناء الاستلام يجب ألا يترك استثناءً غير معالج في أي خيط. */
+    @Test
+    fun failingDiskDoesNotLeakUncaughtExceptions() {
+        val uncaught = CopyOnWriteArrayList<Throwable>()
+        val old = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { _, e -> uncaught.add(e) }
+        try {
+            val data = ByteArray(800_000).also { Random(3).nextBytes(it) }
+            val psk = Crypto.random(32)
+            val (s, r) = pair(psk, psk)
+            val recvErr = AtomicReference<Throwable>()
+            val t1 = thread(isDaemon = true) {
+                try {
+                    Receiver.receive(r, FailSink(), { true }, {})
+                } catch (e: Throwable) {
+                    recvErr.set(e)
+                }
+            }
+            val t2 = thread(isDaemon = true) {
+                try {
+                    Sender.send(s, listOf(SendItem("a.bin", data.size.toLong()) { ByteArrayInputStream(data) })) {}
+                } catch (ignored: Throwable) {
+                }
+            }
+            t1.join(15_000)
+            t2.join(15_000)
+            Thread.sleep(300)
+            assertTrue("receiver should fail with IOException", recvErr.get() is IOException)
+            assertTrue("uncaught: $uncaught", uncaught.isEmpty())
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(old)
+        }
     }
 }

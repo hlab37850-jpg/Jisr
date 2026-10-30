@@ -23,7 +23,10 @@ object T {
     const val FILE_BAD = 11
     const val ABORT = 12
     const val FINISH = 13
+    const val READY = 14
 }
+
+class DeclinedException(msg: String = "تم رفض الاستقبال") : IOException(msg)
 
 class SendItem(val name: String, val size: Long, val open: () -> InputStream)
 data class FileInfo(val name: String, val size: Long)
@@ -40,16 +43,20 @@ interface Sink {
     fun create(name: String, size: Long): SinkFile
 }
 
+private val ILLEGAL = Regex("[\\\\/:*?\"<>|]")
+
 fun sanitizeName(raw: String): String {
     val s = raw.substringAfterLast('/').substringAfterLast('\\')
-        .filter { !it.isISOControl() }.trim().trimStart('.')
+        .filter { !it.isISOControl() }
+        .replace(ILLEGAL, "_")
+        .trim().trimStart('.')
     val t = if (s.length > 150) s.takeLast(150) else s
     return t.ifEmpty { "file" }
 }
 
 /**
  * المرسِل: خيط قراءة (قرص + SHA-256) → طابور → خيط تشفير وإرسال.
- * القراءة والتشفير يتداخلان فيبقى الرابط الشبكي مشغولًا.
+ * لا ينتظر المرسِل تأكيدًا لكل ملف؛ يُرسل بلا توقف حتى نهاية الجلسة.
  */
 object Sender {
     private class Frame(val buf: ByteArray, val len: Int, val pooled: Boolean)
@@ -81,6 +88,15 @@ object Sender {
         val total = items.sumOf { it.size }
         ch.sendControl(T.MANIFEST, manifest(items))
 
+        // انتظار موافقة المستقبِل
+        val rb = ByteArray(1024)
+        ch.recv(rb)
+        when (rb[0].toInt()) {
+            T.READY -> {}
+            T.ABORT -> throw DeclinedException("رفض المستقبِل الاستقبال أو ألغاه")
+            else -> throw IOException("رد غير متوقع من المستقبِل")
+        }
+
         val q = ArrayBlockingQueue<Frame>(6)
         val pool = ArrayBlockingQueue<ByteArray>(8)
         repeat(8) { pool.add(ByteArray(1 + CHUNK)) }
@@ -110,7 +126,7 @@ object Sender {
             } finally {
                 try {
                     q.put(END)
-                } catch (_: InterruptedException) {
+                } catch (ignored: InterruptedException) {
                 }
             }
         }
@@ -137,8 +153,6 @@ object Sender {
         }
         if (total == 0L) onProgress(Progress(0, 0, items.size - 1, items.size, items.last().name))
 
-        // انتظار تأكيدات المستقبِل
-        val rb = ByteArray(1024)
         var ok = 0
         val failed = ArrayList<String>()
         while (true) {
@@ -157,7 +171,8 @@ object Sender {
 
 /**
  * المستقبِل: خيط شبكة (استلام + فك تشفير) → طابور → خيط كتابة (قرص + SHA-256).
- * أي ملف يفشل تحقق SHA-256 أو حجمه يُحذف ولا يُحفظ.
+ * onManifest يقرر القبول (true) أو الرفض (false)؛ أي استثناء فيه يُرسل ABORT للمرسِل.
+ * خيط الكتابة لا يترك أي استثناء دون معالجة (وإلا انهار التطبيق كله).
  */
 object Receiver {
     private class WFrame(val buf: ByteArray, val len: Int)
@@ -182,18 +197,36 @@ object Receiver {
     private fun ack(type: Int, idx: Int): ByteArray =
         ByteBuffer.allocate(5).put(type.toByte()).putInt(idx).array()
 
+    private fun quietAbort(ch: SecureChannel) {
+        try {
+            ch.sendControl(T.ABORT)
+        } catch (ignored: Throwable) {
+        }
+    }
+
     fun receive(
         ch: SecureChannel,
         sink: Sink,
-        onManifest: (List<FileInfo>) -> Unit,
+        onManifest: (List<FileInfo>) -> Boolean,
         onProgress: (Progress) -> Unit,
     ): Outcome {
         val big = ByteArray(MAX_PLAIN)
         val n0 = ch.recv(big)
         if (big[0].toInt() != T.MANIFEST) throw IOException("بروتوكول غير صالح")
         val files = parseManifest(big, n0)
-        onManifest(files)
         val total = files.sumOf { it.size }
+
+        val accepted = try {
+            onManifest(files)
+        } catch (t: Throwable) {
+            quietAbort(ch)
+            throw t
+        }
+        if (!accepted) {
+            quietAbort(ch)
+            throw DeclinedException()
+        }
+        ch.sendControl(T.READY)
 
         val pool = ArrayBlockingQueue<ByteArray>(8)
         repeat(8) { pool.add(ByteArray(1 + CHUNK)) }
@@ -210,60 +243,70 @@ object Receiver {
             var written = 0L
             var done = 0L
             var failed = false
-            while (true) {
-                val f = q.take()
-                if (f === END) break
-                try {
-                    if (!failed) {
-                        when (f.buf[0].toInt()) {
-                            T.FILE_START -> {
-                                val i = ByteBuffer.wrap(f.buf, 1, 4).int
-                                if (i != idx + 1 || i >= files.size) throw IOException("ترتيب ملفات غير صالح")
-                                idx = i
-                                written = 0
-                                md = MessageDigest.getInstance("SHA-256")
-                                cur = sink.create(files[i].name, files[i].size)
-                            }
-                            T.DATA -> {
-                                val c = cur ?: throw IOException("بيانات بلا ملف")
-                                val len = f.len - 1
-                                written += len
-                                if (written > files[idx].size) throw IOException("حجم يتجاوز المعلن")
-                                c.out.write(f.buf, 1, len)
-                                md!!.update(f.buf, 1, len)
-                                done += len
-                                onProgress(Progress(done, total, idx, files.size, files[idx].name))
-                            }
-                            T.FILE_END -> {
-                                val c = cur ?: throw IOException("نهاية ملف بلا بداية")
-                                if (f.len != 33) throw IOException("بصمة غير صالحة")
-                                val same = MessageDigest.isEqual(md!!.digest(), f.buf.copyOfRange(1, 33))
-                                if (same && written == files[idx].size) {
-                                    locations.add(c.commit())
-                                    acks.add(ack(T.FILE_OK, idx))
-                                } else {
-                                    c.discard()
-                                    bad.add(files[idx].name)
-                                    acks.add(ack(T.FILE_BAD, idx))
+            try {
+                while (true) {
+                    val f = q.take()
+                    if (f === END) break
+                    try {
+                        if (!failed) {
+                            when (f.buf[0].toInt()) {
+                                T.FILE_START -> {
+                                    val i = ByteBuffer.wrap(f.buf, 1, 4).int
+                                    if (i != idx + 1 || i >= files.size) throw IOException("ترتيب ملفات غير صالح")
+                                    idx = i
+                                    written = 0
+                                    md = MessageDigest.getInstance("SHA-256")
+                                    cur = sink.create(files[i].name, files[i].size)
                                 }
-                                cur = null
+                                T.DATA -> {
+                                    val c = cur ?: throw IOException("بيانات بلا ملف")
+                                    val len = f.len - 1
+                                    written += len
+                                    if (written > files[idx].size) throw IOException("حجم يتجاوز المعلن")
+                                    c.out.write(f.buf, 1, len)
+                                    md!!.update(f.buf, 1, len)
+                                    done += len
+                                    onProgress(Progress(done, total, idx, files.size, files[idx].name))
+                                }
+                                T.FILE_END -> {
+                                    val c = cur ?: throw IOException("نهاية ملف بلا بداية")
+                                    if (f.len != 33) throw IOException("بصمة غير صالحة")
+                                    val same = MessageDigest.isEqual(md!!.digest(), f.buf.copyOfRange(1, 33))
+                                    if (same && written == files[idx].size) {
+                                        locations.add(c.commit())
+                                        acks.add(ack(T.FILE_OK, idx))
+                                    } else {
+                                        c.discard()
+                                        bad.add(files[idx].name)
+                                        acks.add(ack(T.FILE_BAD, idx))
+                                    }
+                                    cur = null
+                                }
                             }
                         }
+                    } catch (t: Throwable) {
+                        failed = true
+                        err.compareAndSet(null, t)
+                        try {
+                            cur?.discard()
+                        } catch (ignored: Throwable) {
+                        }
+                        cur = null
+                    } finally {
+                        pool.offer(f.buf)
                     }
-                } catch (t: Throwable) {
-                    failed = true
-                    err.compareAndSet(null, t)
-                    try {
-                        cur?.discard()
-                    } catch (_: Throwable) {
-                    }
-                    cur = null
-                } finally {
-                    pool.offer(f.buf)
                 }
-            }
-            if (!failed && (idx != files.size - 1 || cur != null)) {
-                err.compareAndSet(null, IOException("انقطع النقل قبل اكتمال الملفات"))
+                if (!failed && (idx != files.size - 1 || cur != null)) {
+                    err.compareAndSet(null, IOException("انقطع النقل قبل اكتمال الملفات"))
+                }
+            } catch (ignored: InterruptedException) {
+                // الخيط الرئيسي أنهى الجلسة (خطأ/إلغاء): ننظّف بصمت دون إسقاط التطبيق
+                try {
+                    cur?.discard()
+                } catch (ignored: Throwable) {
+                }
+            } catch (t: Throwable) {
+                err.compareAndSet(null, t)
             }
         }
 
@@ -285,10 +328,7 @@ object Receiver {
             writer.join()
             err.get()?.let { throw it }
         } catch (t: Throwable) {
-            try {
-                ch.sendControl(T.ABORT)
-            } catch (_: Throwable) {
-            }
+            quietAbort(ch)
             throw t
         } finally {
             writer.interrupt()
